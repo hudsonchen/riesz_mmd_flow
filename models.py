@@ -54,6 +54,7 @@ class ResidualLatentGenerator(nn.Module):
         super().__init__()
         if depth < 2:
             raise ValueError("--generator-depth must be at least 2")
+        self.latent_dim = latent_dim
         layers: list[nn.Module] = [
             nn.Linear(latent_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
@@ -75,3 +76,79 @@ class ResidualLatentGenerator(nn.Module):
 
     def forward(self, noise: torch.Tensor) -> torch.Tensor:
         return noise + self.residual(noise)
+
+
+class SmallLatentDiT(nn.Module):
+    """Compact residual DiT for spatial VAE latents."""
+
+    def __init__(
+        self,
+        latent_channels: int,
+        latent_spatial: int,
+        hidden_dim: int = 192,
+        depth: int = 6,
+        num_heads: int = 6,
+        patch_size: int = 2,
+    ):
+        super().__init__()
+        if latent_spatial % patch_size:
+            raise ValueError("The latent spatial size must be divisible by patch size")
+        if hidden_dim % num_heads:
+            raise ValueError("DiT hidden size must be divisible by the number of heads")
+        self.latent_channels = latent_channels
+        self.latent_spatial = latent_spatial
+        self.latent_dim = latent_channels * latent_spatial**2
+        self.patch_size = patch_size
+        self.tokens_per_side = latent_spatial // patch_size
+        token_count = self.tokens_per_side**2
+        self.patch_embed = nn.Conv2d(
+            latent_channels, hidden_dim, patch_size, stride=patch_size
+        )
+        self.position = nn.Parameter(torch.zeros(1, token_count, hidden_dim))
+        nn.init.normal_(self.position, std=0.02)
+        layer = nn.TransformerEncoderLayer(
+            d_model=hidden_dim,
+            nhead=num_heads,
+            dim_feedforward=4 * hidden_dim,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,
+        )
+        self.blocks = nn.TransformerEncoder(
+            layer, num_layers=depth, enable_nested_tensor=False
+        )
+        self.final_norm = nn.LayerNorm(hidden_dim)
+        self.to_patches = nn.Linear(
+            hidden_dim, latent_channels * patch_size**2
+        )
+        nn.init.zeros_(self.to_patches.weight)
+        nn.init.zeros_(self.to_patches.bias)
+
+    def _unpatchify(self, tokens: torch.Tensor) -> torch.Tensor:
+        batch = tokens.shape[0]
+        patches = tokens.view(
+            batch,
+            self.tokens_per_side,
+            self.tokens_per_side,
+            self.latent_channels,
+            self.patch_size,
+            self.patch_size,
+        )
+        return (
+            patches.permute(0, 3, 1, 4, 2, 5)
+            .reshape(
+                batch,
+                self.latent_channels,
+                self.latent_spatial,
+                self.latent_spatial,
+            )
+        )
+
+    def forward(self, noise: torch.Tensor) -> torch.Tensor:
+        spatial = noise.view(
+            -1, self.latent_channels, self.latent_spatial, self.latent_spatial
+        )
+        tokens = self.patch_embed(spatial).flatten(2).transpose(1, 2)
+        tokens = self.blocks(tokens + self.position)
+        residual = self._unpatchify(self.to_patches(self.final_norm(tokens)))
+        return (spatial + residual).flatten(1)

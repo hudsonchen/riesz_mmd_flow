@@ -7,13 +7,14 @@ import json
 from pathlib import Path
 
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from PIL import Image, ImageDraw
 from torchvision.utils import save_image
 from tqdm.auto import tqdm
 
 from dataset import make_loader
-from models import PretrainedVAE, ResidualLatentGenerator
+from models import PretrainedVAE, ResidualLatentGenerator, SmallLatentDiT
 from utils.mmd import (
     make_random_projections,
     sliced_riesz_mmd_squared,
@@ -51,7 +52,7 @@ def estimate_latent_stats(
 @torch.no_grad()
 def save_generated_grid(
     vae: PretrainedVAE,
-    generator: ResidualLatentGenerator,
+    generator: nn.Module,
     noise: torch.Tensor,
     mean: torch.Tensor,
     standard_deviation: torch.Tensor,
@@ -107,7 +108,7 @@ def save_mmd_curve(history: list[dict[str, float | int]], path: Path) -> None:
 
 
 def _checkpoint(
-    generator: ResidualLatentGenerator,
+    generator: nn.Module,
     optimizer: torch.optim.Optimizer,
     epoch: int,
     mean: torch.Tensor,
@@ -131,11 +132,17 @@ def _checkpoint(
         "reference_targets": reference_targets.cpu(),
         "history": history,
         "config": {
-            "latent_dim": generator.residual[-1].out_features,
+            "latent_dim": int(generator.latent_dim),
+            "architecture": args.generator_arch,
             "hidden_dim": args.generator_hidden,
             "depth": args.generator_depth,
+            "dit_hidden_dim": args.dit_hidden,
+            "dit_depth": args.dit_depth,
+            "dit_heads": args.dit_heads,
+            "dit_patch_size": args.dit_patch_size,
             "vae_model": args.vae_model,
             "image_size": args.image_size,
+            "dataset": args.dataset,
         },
     }
 
@@ -146,6 +153,7 @@ def train_generator(args: argparse.Namespace, device: torch.device) -> Path:
         args.vae_model, args.image_size, device, args.local_files_only
     )
     loader = make_loader(
+        dataset_name=args.dataset,
         data_root=args.data_root,
         image_size=args.image_size,
         max_images=args.max_images,
@@ -155,7 +163,7 @@ def train_generator(args: argparse.Namespace, device: torch.device) -> Path:
     try:
         reference_images = next(iter(loader))
     except StopIteration as error:
-        raise RuntimeError("The CelebA loader yielded no images") from error
+        raise RuntimeError(f"The {args.dataset.upper()} loader yielded no images") from error
     save_reconstruction_check(
         vae, reference_images, device, args.output_dir / "vae_reconstructions.png"
     )
@@ -165,15 +173,37 @@ def train_generator(args: argparse.Namespace, device: torch.device) -> Path:
         state = torch.load(
             args.resume.expanduser(), map_location=device, weights_only=False
         )
-    generator_hidden = (
-        int(state["config"]["hidden_dim"]) if state else args.generator_hidden
+    selected_architecture = (
+        state["config"].get("architecture", "mlp")
+        if state
+        else ("dit" if args.generator_arch == "auto" and args.dataset == "celeba" else args.generator_arch)
     )
+    if selected_architecture == "auto":
+        selected_architecture = "mlp"
+    args.generator_arch = selected_architecture
+    generator_hidden = int(state["config"]["hidden_dim"]) if state else args.generator_hidden
     generator_depth = int(state["config"]["depth"]) if state else args.generator_depth
     args.generator_hidden = generator_hidden
     args.generator_depth = generator_depth
-    generator = ResidualLatentGenerator(
-        vae.latent_dim, generator_hidden, generator_depth
-    ).to(device)
+    if selected_architecture == "dit":
+        args.dit_hidden = int(state["config"]["dit_hidden_dim"]) if state else args.dit_hidden
+        args.dit_depth = int(state["config"]["dit_depth"]) if state else args.dit_depth
+        args.dit_heads = int(state["config"]["dit_heads"]) if state else args.dit_heads
+        args.dit_patch_size = int(state["config"]["dit_patch_size"]) if state else args.dit_patch_size
+        generator = SmallLatentDiT(
+            vae.latent_channels,
+            vae.latent_spatial,
+            args.dit_hidden,
+            args.dit_depth,
+            args.dit_heads,
+            args.dit_patch_size,
+        ).to(device)
+    else:
+        generator = ResidualLatentGenerator(
+            vae.latent_dim, generator_hidden, generator_depth
+        ).to(device)
+    parameter_count = sum(parameter.numel() for parameter in generator.parameters())
+    print(f"Using {selected_architecture.upper()} generator ({parameter_count:,} parameters)")
     optimizer = torch.optim.AdamW(
         generator.parameters(), lr=args.lr, weight_decay=args.weight_decay
     )

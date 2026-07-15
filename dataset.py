@@ -1,4 +1,4 @@
-"""CelebA dataset discovery and data-loader construction."""
+"""FFHQ and CelebA image discovery and data-loader construction."""
 
 from __future__ import annotations
 
@@ -13,39 +13,58 @@ from torchvision import transforms
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
 
 
-class CelebAImages(Dataset):
-    """Load CelebA images without requiring its optional annotation files."""
+class FaceImages(Dataset):
+    """Load aligned face images from FFHQ or CelebA directory layouts."""
 
-    def __init__(self, root: str | Path, image_size: int, max_images: int | None = None):
+    def __init__(
+        self,
+        root: str | Path,
+        dataset_name: str,
+        image_size: int,
+        max_images: int | None = None,
+    ):
         self.root = Path(root).expanduser().resolve()
+        self.dataset_name = dataset_name
         if not self.root.exists():
             raise FileNotFoundError(
-                f"CelebA root does not exist: {self.root}\n"
-                "Pass the location explicitly with --data-root."
+                f"{dataset_name.upper()} root does not exist: {self.root}\n"
+                "Download/extract the images there or pass --data-root."
             )
 
-        preferred = [
-            self.root / "img_align_celeba",
-            self.root / "images",
-            self.root / "celeba" / "img_align_celeba",
-        ]
-        image_root = next((path for path in preferred if path.is_dir()), self.root)
+        preferred = (
+            [
+                self.root / "images1024x1024",
+                self.root / "images",
+                self.root / "ffhq" / "images1024x1024",
+            ]
+            if dataset_name == "ffhq"
+            else [
+                self.root / "img_align_celeba",
+                self.root / "images",
+                self.root / "celeba" / "img_align_celeba",
+            ]
+        )
+        self.image_root = next(
+            (path for path in preferred if path.is_dir()), self.root
+        )
         self.files = sorted(
             path
-            for path in image_root.rglob("*")
+            for path in self.image_root.rglob("*")
             if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS
         )
         if max_images is not None:
             self.files = self.files[:max_images]
         if not self.files:
-            raise RuntimeError(
-                f"No images found below {image_root}. Expected jpg/png files, usually in "
-                "<data-root>/img_align_celeba/."
-            )
+            raise RuntimeError(f"No jpg/png images found below {self.image_root}")
 
+        crop = (
+            transforms.CenterCrop(178)
+            if dataset_name == "celeba"
+            else transforms.Lambda(lambda image: image)
+        )
         self.transform = transforms.Compose(
             [
-                transforms.CenterCrop(178),
+                crop,
                 transforms.Resize((image_size, image_size), antialias=True),
                 transforms.RandomHorizontalFlip(),
                 transforms.ToTensor(),
@@ -63,6 +82,7 @@ class CelebAImages(Dataset):
 
 def make_loader(
     *,
+    dataset_name: str,
     data_root: str | Path,
     image_size: int,
     max_images: int | None,
@@ -70,8 +90,11 @@ def make_loader(
     num_workers: int,
     shuffle: bool = True,
 ) -> DataLoader:
-    dataset = CelebAImages(data_root, image_size, max_images)
-    print(f"Found {len(dataset):,} images under {dataset.root}")
+    dataset = FaceImages(data_root, dataset_name, image_size, max_images)
+    print(
+        f"Found {len(dataset):,} {dataset_name.upper()} images under "
+        f"{dataset.image_root}"
+    )
     return DataLoader(
         dataset,
         batch_size=batch_size,
