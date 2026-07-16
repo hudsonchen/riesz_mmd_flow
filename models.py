@@ -1,9 +1,12 @@
-"""Frozen image representation and one-step latent generator."""
+"""Frozen face representations and one-step latent generators."""
 
 from __future__ import annotations
 
 import torch
 import torch.nn as nn
+from pathlib import Path
+import os
+import sys
 
 
 class PretrainedVAE(nn.Module):
@@ -45,6 +48,106 @@ class PretrainedVAE(nn.Module):
             -1, self.latent_channels, self.latent_spatial, self.latent_spatial
         )
         return self.vae.decode(latents / self.scaling_factor).sample.clamp(-1, 1)
+
+
+class PretrainedALAE(nn.Module):
+    """Frozen official StyleALAE FFHQ encoder and decoder.
+
+    The model exposes the official 512-dimensional FFHQ or 256-dimensional
+    CelebA W latent, at the resolution on which each checkpoint was trained.
+    """
+
+    def __init__(
+        self,
+        checkpoint_path: str | Path,
+        image_size: int,
+        device: torch.device,
+        source_root: str | Path,
+        dataset_name: str,
+    ):
+        super().__init__()
+        presets = {
+            "ffhq": dict(
+                resolution=1024,
+                latent_dim=512,
+                startf=16,
+                layer_count=9,
+                maxf=512,
+            ),
+            "celeba": dict(
+                resolution=128,
+                latent_dim=256,
+                startf=64,
+                layer_count=6,
+                maxf=256,
+            ),
+        }
+        preset = presets[dataset_name]
+        if image_size != preset["resolution"]:
+            raise ValueError(
+                f"The pretrained {dataset_name.upper()} ALAE requires "
+                f"--image-size {preset['resolution']}, got {image_size}"
+            )
+        self.image_size = image_size
+        self.lod = image_size.bit_length() - 3
+        self.latent_dim = preset["latent_dim"]
+        self.latent_channels = self.latent_dim
+        self.latent_spatial = 1
+
+        source_root = Path(source_root).expanduser().resolve()
+        checkpoint_path = Path(checkpoint_path).expanduser().resolve()
+        if not (source_root / "model.py").is_file():
+            raise FileNotFoundError(f"Official ALAE source not found: {source_root}")
+        if not checkpoint_path.is_file():
+            raise FileNotFoundError(
+                f"Official ALAE checkpoint not found: {checkpoint_path}\n"
+                "Download model_submitted.pth from the official ALAE repository."
+            )
+
+        source_string = str(source_root)
+        if source_string not in sys.path:
+            sys.path.insert(0, source_string)
+        # Upstream ALAE uses an absolute ``utils`` import, which otherwise
+        # collides with this project's ``utils`` package.
+        project_utils = sys.modules.pop("utils", None)
+        try:
+            import lreq  # type: ignore
+            from model import Model  # type: ignore
+        finally:
+            sys.modules.pop("utils", None)
+            if project_utils is not None:
+                sys.modules["utils"] = project_utils
+
+        lreq.use_implicit_lreq.set(True)
+        self.alae = Model(
+            startf=preset["startf"],
+            layer_count=preset["layer_count"],
+            maxf=preset["maxf"],
+            latent_size=self.latent_dim,
+            dlatent_avg_beta=0.995,
+            truncation_psi=0.7,
+            truncation_cutoff=8,
+            style_mixing_prob=0.9,
+            mapping_layers=8,
+            channels=3,
+            generator="GeneratorDefault",
+            encoder="EncoderDefault",
+        ).to(device)
+        os.environ.setdefault("MPLCONFIGDIR", "/tmp/mmd-flow-matplotlib")
+        checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+        models = checkpoint.get("models", checkpoint)
+        self.alae.encoder.load_state_dict(models["discriminator_s"])
+        self.alae.decoder.load_state_dict(models["generator_s"])
+        self.alae.eval()
+        self.alae.requires_grad_(False)
+
+    def encode(self, images: torch.Tensor) -> torch.Tensor:
+        latent = self.alae.encoder(images, self.lod, 1.0)
+        return latent[:, 0]
+
+    def decode(self, latents: torch.Tensor) -> torch.Tensor:
+        styles = latents[:, None, :].repeat(1, self.alae.mapping_f.num_layers, 1)
+        return self.alae.decoder(styles, self.lod, 1.0, noise=False).clamp(-1, 1)
 
 
 class ResidualLatentGenerator(nn.Module):

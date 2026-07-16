@@ -1,4 +1,4 @@
-"""Train an amortized latent generator from sliced Riesz-flow targets."""
+"""Train an amortized latent generator from Riesz-kernel MMD flow targets."""
 
 from __future__ import annotations
 
@@ -11,20 +11,17 @@ import torch.nn as nn
 import torch.nn.functional as F
 from PIL import Image, ImageDraw
 from torchvision.utils import save_image
+from torch.utils.data import DataLoader, TensorDataset
 from tqdm.auto import tqdm
 
 from dataset import make_loader
-from models import PretrainedVAE, ResidualLatentGenerator, SmallLatentDiT
-from utils.mmd import (
-    make_random_projections,
-    sliced_riesz_mmd_squared,
-    sliced_riesz_velocity,
-)
+from models import PretrainedALAE, PretrainedVAE, ResidualLatentGenerator, SmallLatentDiT
+from utils.mmd import riesz_mmd_squared, riesz_velocity
 
 
 @torch.no_grad()
 def estimate_latent_stats(
-    vae: PretrainedVAE,
+    vae: PretrainedVAE | PretrainedALAE,
     loader: torch.utils.data.DataLoader,
     device: torch.device,
     max_images: int,
@@ -50,8 +47,52 @@ def estimate_latent_stats(
 
 
 @torch.no_grad()
+def build_alae_latent_cache(
+    alae: PretrainedALAE,
+    loader: DataLoader,
+    cache_path: Path,
+    expected_count: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """Encode a face dataset once and persist compact 512-D ALAE latents."""
+    if cache_path.is_file():
+        cache = torch.load(cache_path, map_location="cpu", weights_only=True)
+        latents = cache["latents"]
+        if int(cache.get("count", -1)) != expected_count:
+            raise RuntimeError(
+                f"ALAE cache has {len(latents):,} entries but the dataset has "
+                f"{expected_count:,}: {cache_path}"
+            )
+        print(f"Loaded {len(latents):,} cached ALAE latents from {cache_path}")
+        return latents.float()
+
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    encoded_batches = []
+    progress = tqdm(loader, desc="Caching ALAE latents", unit="batch")
+    for images in progress:
+        encoded_batches.append(
+            alae.encode(images.to(device, non_blocking=True)).half().cpu()
+        )
+    latents = torch.cat(encoded_batches)
+    if len(latents) != expected_count:
+        raise RuntimeError(
+            f"Encoded {len(latents):,} ALAE latents, expected {expected_count:,}"
+        )
+    torch.save({"latents": latents, "count": expected_count}, cache_path)
+    print(f"Saved {len(latents):,} ALAE latents to {cache_path}")
+    return latents.float()
+
+
+def latent_stats(latents: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    values = latents.double()
+    mean = values.mean(dim=0, keepdim=True)
+    standard_deviation = values.var(dim=0, correction=0).clamp_min(1e-6).sqrt()
+    return mean.float(), standard_deviation.float()
+
+
+@torch.no_grad()
 def save_generated_grid(
-    vae: PretrainedVAE,
+    vae: PretrainedVAE | PretrainedALAE,
     generator: nn.Module,
     noise: torch.Tensor,
     mean: torch.Tensor,
@@ -66,7 +107,10 @@ def save_generated_grid(
 
 @torch.no_grad()
 def save_reconstruction_check(
-    vae: PretrainedVAE, images: torch.Tensor, device: torch.device, path: Path
+    vae: PretrainedVAE | PretrainedALAE,
+    images: torch.Tensor,
+    device: torch.device,
+    path: Path,
 ) -> None:
     originals = images[:5].to(device)
     reconstructions = vae.decode(vae.encode(originals))
@@ -99,7 +143,7 @@ def save_mmd_curve(history: list[dict[str, float | int]], path: Path) -> None:
         draw.ellipse((x - 4, y - 4, x + 4, y + 4), fill="#1f77b4")
     draw.text((width // 2 - 75, 15), "Generator MMD convergence", fill="black")
     draw.text((width // 2 - 30, height - 35), "Epoch", fill="black")
-    draw.text((8, 18), "Sliced Riesz MMD squared", fill="black")
+    draw.text((8, 18), "Riesz MMD squared", fill="black")
     draw.text((left - 75, top - 7), f"{value_max:.4g}", fill="black")
     draw.text((left - 75, height - bottom - 7), f"{value_min:.4g}", fill="black")
     for epoch, (x, _) in zip(epochs, points):
@@ -115,7 +159,6 @@ def _checkpoint(
     standard_deviation: torch.Tensor,
     fixed_noise: torch.Tensor,
     diagnostic_noise: torch.Tensor,
-    diagnostic_projections: torch.Tensor,
     reference_targets: torch.Tensor,
     history: list[dict[str, float | int]],
     args: argparse.Namespace,
@@ -128,7 +171,6 @@ def _checkpoint(
         "latent_standard_deviation": standard_deviation.cpu(),
         "fixed_noise": fixed_noise.cpu(),
         "diagnostic_noise": diagnostic_noise.cpu(),
-        "diagnostic_projections": diagnostic_projections.cpu(),
         "reference_targets": reference_targets.cpu(),
         "history": history,
         "config": {
@@ -141,32 +183,69 @@ def _checkpoint(
             "dit_heads": args.dit_heads,
             "dit_patch_size": args.dit_patch_size,
             "vae_model": args.vae_model,
+            "autoencoder": args.autoencoder,
             "image_size": args.image_size,
             "dataset": args.dataset,
+            "optimizer": "AdamW",
+            "learning_rate": args.lr,
+            "adam_betas": (args.adam_beta1, args.adam_beta2),
+            "weight_decay": args.weight_decay,
         },
     }
 
 
 def train_generator(args: argparse.Namespace, device: torch.device) -> Path:
-    print(f"Loading frozen VAE: {args.vae_model}")
-    vae = PretrainedVAE(
-        args.vae_model, args.image_size, device, args.local_files_only
-    )
-    loader = make_loader(
+    if args.autoencoder == "alae":
+        print(f"Loading frozen {args.dataset.upper()} ALAE: {args.alae_checkpoint}")
+        vae = PretrainedALAE(
+            args.alae_checkpoint,
+            args.image_size,
+            device,
+            args.alae_source,
+            args.dataset,
+        )
+    else:
+        print(f"Loading frozen VAE: {args.vae_model}")
+        vae = PretrainedVAE(
+            args.vae_model, args.image_size, device, args.local_files_only
+        )
+    image_loader = make_loader(
         dataset_name=args.dataset,
         data_root=args.data_root,
         image_size=args.image_size,
         max_images=args.max_images,
-        batch_size=args.batch_size,
+        batch_size=(
+            args.encoding_batch_size if args.autoencoder == "alae" else args.batch_size
+        ),
         num_workers=args.num_workers,
     )
     try:
-        reference_images = next(iter(loader))
+        reference_images = next(iter(image_loader))
     except StopIteration as error:
         raise RuntimeError(f"The {args.dataset.upper()} loader yielded no images") from error
     save_reconstruction_check(
         vae, reference_images, device, args.output_dir / "vae_reconstructions.png"
     )
+
+    using_cached_latents = args.autoencoder == "alae"
+    if using_cached_latents:
+        cached_latents = build_alae_latent_cache(
+            vae,
+            image_loader,
+            args.alae_latent_cache,
+            len(image_loader.dataset),
+            device,
+        )
+        loader = DataLoader(
+            TensorDataset(cached_latents),
+            batch_size=args.batch_size,
+            shuffle=True,
+            num_workers=0,
+            drop_last=False,
+        )
+    else:
+        cached_latents = None
+        loader = image_loader
 
     state = None
     if args.resume:
@@ -176,7 +255,7 @@ def train_generator(args: argparse.Namespace, device: torch.device) -> Path:
     selected_architecture = (
         state["config"].get("architecture", "mlp")
         if state
-        else ("dit" if args.generator_arch == "auto" and args.dataset == "celeba" else args.generator_arch)
+        else ("mlp" if args.generator_arch == "auto" else args.generator_arch)
     )
     if selected_architecture == "auto":
         selected_architecture = "mlp"
@@ -205,25 +284,37 @@ def train_generator(args: argparse.Namespace, device: torch.device) -> Path:
     parameter_count = sum(parameter.numel() for parameter in generator.parameters())
     print(f"Using {selected_architecture.upper()} generator ({parameter_count:,} parameters)")
     optimizer = torch.optim.AdamW(
-        generator.parameters(), lr=args.lr, weight_decay=args.weight_decay
+        generator.parameters(),
+        lr=args.lr,
+        betas=(args.adam_beta1, args.adam_beta2),
+        weight_decay=args.weight_decay,
     )
     start_epoch = 0
     if state is not None:
         generator.load_state_dict(state["generator"])
         optimizer.load_state_dict(state["optimizer"])
+        # Old checkpoints may contain PyTorch's default beta2=0.999. Keep the
+        # paper's optimizer hyperparameters when resuming those weights.
+        for parameter_group in optimizer.param_groups:
+            parameter_group["lr"] = args.lr
+            parameter_group["betas"] = (args.adam_beta1, args.adam_beta2)
+            parameter_group["weight_decay"] = args.weight_decay
         mean = state["latent_mean"].to(device)
         standard_deviation = state["latent_standard_deviation"].to(device)
         start_epoch = int(state["epoch"]) + 1
     else:
-        stats_count = min(args.stats_images, len(loader.dataset))
-        mean, standard_deviation = estimate_latent_stats(
-            vae, loader, device, stats_count
-        )
+        if cached_latents is not None:
+            stats_count = min(args.stats_images, len(cached_latents))
+            mean, standard_deviation = latent_stats(cached_latents[:stats_count])
+        else:
+            stats_count = min(args.stats_images, len(loader.dataset))
+            mean, standard_deviation = estimate_latent_stats(
+                vae, loader, device, stats_count
+            )
 
     if state is not None:
         fixed_noise = state["fixed_noise"].to(device)
         diagnostic_noise = state["diagnostic_noise"].to(device)
-        diagnostic_projections = state["diagnostic_projections"].to(device)
         reference_targets = state["reference_targets"].to(device)
         history = state["history"]
     else:
@@ -232,16 +323,13 @@ def train_generator(args: argparse.Namespace, device: torch.device) -> Path:
             args.particles_per_step, vae.latent_dim, device=device
         )
         with torch.no_grad():
-            reference_targets = vae.encode(reference_images.to(device)).float()
+            if cached_latents is not None:
+                reference_targets = cached_latents[: args.batch_size].to(device)
+            else:
+                reference_targets = vae.encode(reference_images.to(device)).float()
             reference_targets = (reference_targets - mean) / standard_deviation
-            diagnostic_projections = make_random_projections(
-                diagnostic_noise, args.num_projections
-            )
-            initial_mmd = sliced_riesz_mmd_squared(
-                generator(diagnostic_noise),
-                reference_targets,
-                args.num_projections,
-                diagnostic_projections,
+            initial_mmd = riesz_mmd_squared(
+                generator(diagnostic_noise), reference_targets
             )
         history: list[dict[str, float | int]] = [
             {"epoch": 0, "mmd_squared": initial_mmd, "loss": 0.0}
@@ -262,17 +350,20 @@ def train_generator(args: argparse.Namespace, device: torch.device) -> Path:
         progress = tqdm(
             loader, desc=f"Generator epoch {epoch + 1}/{args.epochs}", unit="batch"
         )
-        for step, images in enumerate(progress, start=1):
+        for step, batch in enumerate(progress, start=1):
             with torch.no_grad():
-                targets = vae.encode(images.to(device, non_blocking=True)).float()
+                if using_cached_latents:
+                    targets = batch[0].to(device, non_blocking=True).float()
+                else:
+                    targets = vae.encode(batch.to(device, non_blocking=True)).float()
                 targets = (targets - mean) / standard_deviation
             noise = torch.randn(
                 args.particles_per_step, vae.latent_dim, device=device
             )
             generated = generator(noise)
             with torch.no_grad():
-                velocity = sliced_riesz_velocity(
-                    generated.detach(), targets, args.num_projections
+                velocity = riesz_velocity(
+                    generated.detach(), targets, args.riesz_epsilon
                 )
                 norms = velocity.norm(dim=1, keepdim=True)
                 scale = (
@@ -289,11 +380,8 @@ def train_generator(args: argparse.Namespace, device: torch.device) -> Path:
 
         generator.eval()
         with torch.no_grad():
-            mmd_value = sliced_riesz_mmd_squared(
-                generator(diagnostic_noise),
-                reference_targets,
-                args.num_projections,
-                diagnostic_projections,
+            mmd_value = riesz_mmd_squared(
+                generator(diagnostic_noise), reference_targets
             )
         average_loss = running_loss / len(loader)
         history.append(
@@ -320,7 +408,6 @@ def train_generator(args: argparse.Namespace, device: torch.device) -> Path:
                 standard_deviation,
                 fixed_noise,
                 diagnostic_noise,
-                diagnostic_projections,
                 reference_targets,
                 history,
                 args,

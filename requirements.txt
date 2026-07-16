@@ -4,4 +4,5 @@ torch>=2.3
 torchvision>=0.18
 diffusers>=0.29
 huggingface-hub>=0.24
+matplotlib>=3.7
 tqdm>=4.66
