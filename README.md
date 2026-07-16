@@ -1,4 +1,4 @@
-# FFHQ/CelebA one-step Riesz-MMD generator
+# Face/ImageNet-subset one-step Riesz-MMD generator
 
 This experiment trains an amortized neural generator for aligned face images. FFHQ
 is the default, while CelebA remains available as a smaller alternative. The
@@ -7,6 +7,11 @@ dataset: 512-dimensional FFHQ latents at 1024x1024, or 256-dimensional CelebA
 latents at 128x128. A residual MLP maps Gaussian noise to normalized ALAE
 latents in one forward pass. The former Stable Diffusion VAE remains
 available with `--autoencoder sd-vae`.
+
+An experimental ImageNet-64 mode selects the first 100 sorted ImageNet synset
+directories, uses the frozen SD VAE, and trains the spatial latent DiT. This is
+an unconditional 100-class pilot rather than the paper's full class-conditional
+ImageNet system.
 
 The generator is not trained by backpropagating through the discrepancy.
 Instead, each generated latent receives a stop-gradient transport target from
@@ -51,6 +56,18 @@ CelebA can still be selected with:
 python main.py --dataset celeba --local-files-only
 ```
 
+Run the 100-class ImageNet-64 pilot with:
+
+```bash
+python main.py --dataset imagenet \
+  --data-root /path/to/ILSVRC2012 \
+  --imagenet-classes 100
+```
+
+The expected layout is `train/<synset>/*.JPEG`. Class folders are sorted by
+synset name before the first 100 are selected, so the subset is deterministic.
+Use `--local-files-only` after the SD VAE has been downloaded once.
+
 ## Training behavior
 
 Before training, the program estimates coordinate-wise ALAE latent statistics
@@ -69,7 +86,7 @@ Optimization follows the paper's FFHQ setup: AdamW with learning rate
 
 Architecture selection defaults to `auto`, which uses the paper's four-layer
 residual MLP with hidden width 1,024 for both face datasets. The optional compact
-spatial DiT is available only with the SD VAE representation. Both generators
+spatial DiT is selected automatically for ImageNet. Both generators
 have zero-initialized output projections, so their
 initial maps are the identity on normalized latent space. Override the choice
 with `--generator-arch dit` or `--generator-arch mlp`.

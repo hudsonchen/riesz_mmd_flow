@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Train a one-step face generator with Riesz-kernel MMD flow targets."""
+"""Train a one-step image generator with Riesz-kernel MMD flow targets."""
 
 from __future__ import annotations
 
@@ -47,7 +47,15 @@ def build_parser() -> argparse.ArgumentParser:
         action=argparse.BooleanOptionalAction,
         default=False,
     )
-    parser.add_argument("--dataset", choices=("ffhq", "celeba"), default="celeba")
+    parser.add_argument(
+        "--dataset", choices=("ffhq", "celeba", "imagenet"), default="celeba"
+    )
+    parser.add_argument(
+        "--imagenet-classes",
+        type=int,
+        default=100,
+        help="number of sorted ImageNet synset directories to include",
+    )
     parser.add_argument("--data-root", type=Path, default=None)
     parser.add_argument("--output-dir", type=Path, default=None)
     parser.add_argument("--resume", type=Path, default=None)
@@ -62,6 +70,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--max-images", type=int, default=None)
     parser.add_argument("--stats-images", type=int, default=4096)
+    parser.add_argument(
+        "--diagnostic-images",
+        type=int,
+        default=1024,
+        help="number of fixed real-image latents used for epoch-level MMD",
+    )
     parser.add_argument(
         "--generator-arch", choices=("auto", "dit", "mlp"), default="auto"
     )
@@ -83,6 +97,13 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     args = build_parser().parse_args()
+    if args.imagenet_classes < 1:
+        raise ValueError("--imagenet-classes must be positive")
+    if args.diagnostic_images < 2:
+        raise ValueError("--diagnostic-images must be at least 2")
+    if args.dataset == "imagenet" and args.autoencoder == "alae":
+        print("ImageNet uses the SD VAE; overriding --autoencoder alae")
+        args.autoencoder = "sd-vae"
     if args.data_root is None:
         args.data_root = (
             Path("/home/zongchen/MMD_Wflow/data/ffhq-dataset")
@@ -114,7 +135,12 @@ def main() -> None:
         )
     args.alae_latent_cache = args.alae_latent_cache.expanduser().resolve()
     if args.output_dir is None:
-        args.output_dir = Path("outputs_new") / f"{args.dataset}_mmd_flow"
+        name = (
+            f"imagenet64_{args.imagenet_classes}classes_mmd_flow"
+            if args.dataset == "imagenet"
+            else f"{args.dataset}_mmd_flow"
+        )
+        args.output_dir = Path("outputs_new") / name
     args.output_dir = args.output_dir.expanduser().resolve()
     device = (
         torch.device("cuda" if torch.cuda.is_available() else "cpu")

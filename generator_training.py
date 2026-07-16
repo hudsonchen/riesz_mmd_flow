@@ -91,6 +91,30 @@ def latent_stats(latents: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
 
 
 @torch.no_grad()
+def collect_reference_latents(
+    vae: PretrainedVAE | PretrainedALAE,
+    loader: DataLoader,
+    device: torch.device,
+    max_images: int,
+) -> torch.Tensor:
+    """Encode a fixed real-data reference set for epoch-level diagnostics."""
+    encoded_batches = []
+    count = 0
+    progress = tqdm(loader, desc="Collecting diagnostic references", unit="batch")
+    for batch in progress:
+        images = batch[0] if isinstance(batch, (tuple, list)) else batch
+        latents = vae.encode(images.to(device, non_blocking=True)).float()
+        remaining = max_images - count
+        encoded_batches.append(latents[:remaining])
+        count += min(latents.shape[0], remaining)
+        if count >= max_images:
+            break
+    if count < 2:
+        raise RuntimeError("At least two images are needed for MMD diagnostics")
+    return torch.cat(encoded_batches, dim=0)
+
+
+@torch.no_grad()
 def save_generated_grid(
     vae: PretrainedVAE | PretrainedALAE,
     generator: nn.Module,
@@ -186,6 +210,8 @@ def _checkpoint(
             "autoencoder": args.autoencoder,
             "image_size": args.image_size,
             "dataset": args.dataset,
+            "imagenet_classes": args.imagenet_classes,
+            "diagnostic_images": args.diagnostic_images,
             "optimizer": "AdamW",
             "learning_rate": args.lr,
             "adam_betas": (args.adam_beta1, args.adam_beta2),
@@ -218,6 +244,7 @@ def train_generator(args: argparse.Namespace, device: torch.device) -> Path:
             args.encoding_batch_size if args.autoencoder == "alae" else args.batch_size
         ),
         num_workers=args.num_workers,
+        imagenet_classes=args.imagenet_classes,
     )
     try:
         reference_images = next(iter(image_loader))
@@ -255,7 +282,11 @@ def train_generator(args: argparse.Namespace, device: torch.device) -> Path:
     selected_architecture = (
         state["config"].get("architecture", "mlp")
         if state
-        else ("mlp" if args.generator_arch == "auto" else args.generator_arch)
+        else (
+            ("dit" if args.dataset == "imagenet" else "mlp")
+            if args.generator_arch == "auto"
+            else args.generator_arch
+        )
     )
     if selected_architecture == "auto":
         selected_architecture = "mlp"
@@ -311,6 +342,8 @@ def train_generator(args: argparse.Namespace, device: torch.device) -> Path:
             mean, standard_deviation = estimate_latent_stats(
                 vae, loader, device, stats_count
             )
+        mean = mean.to(device)
+        standard_deviation = standard_deviation.to(device)
 
     if state is not None:
         fixed_noise = state["fixed_noise"].to(device)
@@ -324,9 +357,13 @@ def train_generator(args: argparse.Namespace, device: torch.device) -> Path:
         )
         with torch.no_grad():
             if cached_latents is not None:
-                reference_targets = cached_latents[: args.batch_size].to(device)
+                reference_count = min(args.diagnostic_images, len(cached_latents))
+                reference_targets = cached_latents[:reference_count].to(device)
             else:
-                reference_targets = vae.encode(reference_images.to(device)).float()
+                reference_count = min(args.diagnostic_images, len(image_loader.dataset))
+                reference_targets = collect_reference_latents(
+                    vae, image_loader, device, reference_count
+                )
             reference_targets = (reference_targets - mean) / standard_deviation
             initial_mmd = riesz_mmd_squared(
                 generator(diagnostic_noise), reference_targets
